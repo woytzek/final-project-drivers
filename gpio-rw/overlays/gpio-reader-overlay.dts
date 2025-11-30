@@ -1,0 +1,27 @@
+/dts-v1/;
+/plugin/;
+
+/ {
+    compatible = "brcm,bcm2835";
+
+    fragment@0 {
+        target-path = "/";
+        __overlay__ {
+            gpio_reader {
+                compatible = "gpio-reader";
+                status = "okay";
+                
+                /* Define 8 GPIO pins for Raspberry Pi 3 B+ */
+                /* Using commonly available GPIO pins that are not used by default functions */
+                gpios = <&gpio 16 0>,    /* GPIO16, active high */
+                        <&gpio 17 0>,    /* GPIO17, active high */
+                        <&gpio 22 0>,    /* GPIO22, active high */
+                        <&gpio 23 0>,    /* GPIO23, active high */
+                        <&gpio 24 0>;    /* GPIO24, active high */
+                        <&gpio 25 0>;    /* GPIO25, active high */
+                        <&gpio 26 0>;    /* GPIO26, active high */
+                        <&gpio 27 0>;    /* GPIO27, active high */
+            };
+        };
+    };
+};

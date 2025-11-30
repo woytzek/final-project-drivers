@@ -1,0 +1,28 @@
+# Ignore compilation artifacts
+
+# Object files, libraries, executables
+*.o
+*.a
+*.so
+*.so.*
+
+# Kernel module / Linux build artifacts
+*.ko
+*.mod
+*.mod.c
+*.cmd
+*.order
+Module.symvers
+modules.order
+.tmp_versions/
+
+# DTB files
+*.dtb
+*.dtbo
+
+# Misc temp files
+*~
+*.swp
+*.bak
+*.tmp
+*.code-workspace
