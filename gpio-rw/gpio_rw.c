@@ -38,7 +38,7 @@ typedef unsigned int dev_t;
 
 #endif
 
-#define GPIO_RW_DEBUG
+//#define GPIO_RW_DEBUG
 
 #undef PDEBUG
 #ifdef GPIO_RW_DEBUG
@@ -65,8 +65,9 @@ DEFINE_SPINLOCK(gpio_rw_lock);
 
 struct gpio_rw_pin_state
 {
-    unsigned int value;     // 0: low, 1: high
-    ktime_t timestamp;
+    unsigned int value;     // debounced value, 0: low, 1: high
+    unsigned int ud_value;  // actual, nto debounced value from gpio
+    unsigned long timestamp;
 };
 
 struct gpio_rw_pin
@@ -89,23 +90,27 @@ static struct cdev gpio_cdev;
 static struct class *gpio_class;
 static struct device *gpio_device;
 
-#define DEBOUNCE_TIME_MS 65
+#define DEBOUNCE_TIME_MS 40
 
+/* interrupt handler 
+    - debounces input changes in both directions
+*/
 static irqreturn_t gpio_rw_irq_handler(int irq, void *dev_id)
 {
     struct gpio_rw_pin *pin = (struct gpio_rw_pin *)dev_id;
-    //PDEBUG("gpio_rw: IRQ %d triggered for GPIO %u\n", irq, pin->num);
-    if( time_after(jiffies, pin->state.timestamp + msecs_to_jiffies(DEBOUNCE_TIME_MS)) == 0 )
-    {
-        //PDEBUG("gpio_rw: IRQ %d for GPIO %u ignored due to debounce\n", irq, pin->num);
-        return IRQ_HANDLED;
-    }
+    unsigned int new_ud_value = gpiod_get_value(pin->desc);
 
     unsigned long flags;
     spin_lock_irqsave(&gpio_rw_lock, flags);
-    pin->state.value = gpiod_get_value(pin->desc);
-    pin->state.timestamp = jiffies;
-    PDEBUG("gpio_rw: GPIO %u changed to %d\n", pin->num, pin->state.value);
+
+    if( new_ud_value != pin->state.ud_value )
+    {
+        // value changed, reset timestamp
+        pin->state.ud_value = new_ud_value;
+        pin->state.timestamp = jiffies;
+        PDEBUG("gpio_rw: GPIO %u unstable change to %d\n", pin->num, new_ud_value);
+    }
+
     spin_unlock_irqrestore(&gpio_rw_lock, flags);
 
     return IRQ_HANDLED;
@@ -234,6 +239,16 @@ static ssize_t gpio_rw_read(struct file *file, char __user *buf,
     spin_lock_irqsave(&gpio_rw_lock, flags);
     for (i = 0; i < gpio_data.num_pins; i++) 
     {
+        if( gpio_data.pins[i].state.ud_value != gpio_data.pins[i].state.value )
+        {
+            // value changed, check debounce time
+            if( time_after(jiffies, gpio_data.pins[i].state.timestamp + msecs_to_jiffies(DEBOUNCE_TIME_MS)) )
+            {
+                // debounce time passed, update debounced value
+                gpio_data.pins[i].state.value = gpio_data.pins[i].state.ud_value;
+                PDEBUG("gpio_rw: GPIO %u debounced to %d\n", gpio_data.pins[i].num, gpio_data.pins[i].state.value);
+            }
+        }
         if (gpio_data.pins[i].state.value)
         {
             value |= (1 << i);
