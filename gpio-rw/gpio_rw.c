@@ -9,6 +9,8 @@
 #include <linux/of.h>
 #include <linux/of_gpio.h>
 #include <linux/ioctl.h>
+#include <linux/interrupt.h>
+#include <linux/jiffies.h>
 #else
 /* stubs to avoid includePath errors when not building with kernel headers */
 #include <stddef.h>
@@ -59,14 +61,55 @@ typedef unsigned int dev_t;
 int gpio_rw_major =   0; // use dynamic major
 int gpio_rw_minor =   0;
 
-static struct gpio_desc *gpio_descs[MAX_PINS];
-static unsigned int gpio_nums[MAX_PINS];
-static int num_pins;
+DEFINE_SPINLOCK(gpio_rw_lock);
+
+struct gpio_rw_pin_state
+{
+    unsigned int value;     // 0: low, 1: high
+    ktime_t timestamp;
+};
+
+struct gpio_rw_pin
+{
+        struct gpio_desc *desc;
+        unsigned int num;
+        struct gpio_rw_pin_state state;
+};
+
+struct gpio_rw_data
+{
+    struct gpio_rw_pin pins[MAX_PINS];
+    unsigned int num_pins;
+};
+
+static struct gpio_rw_data gpio_data;
 
 static dev_t dev_num;
 static struct cdev gpio_cdev;
 static struct class *gpio_class;
 static struct device *gpio_device;
+
+#define DEBOUNCE_TIME_MS 65
+
+static irqreturn_t gpio_rw_irq_handler(int irq, void *dev_id)
+{
+    struct gpio_rw_pin *pin = (struct gpio_rw_pin *)dev_id;
+    //PDEBUG("gpio_rw: IRQ %d triggered for GPIO %u\n", irq, pin->num);
+    if( time_after(jiffies, pin->state.timestamp + msecs_to_jiffies(DEBOUNCE_TIME_MS)) == 0 )
+    {
+        //PDEBUG("gpio_rw: IRQ %d for GPIO %u ignored due to debounce\n", irq, pin->num);
+        return IRQ_HANDLED;
+    }
+
+    unsigned long flags;
+    spin_lock_irqsave(&gpio_rw_lock, flags);
+    pin->state.value = gpiod_get_value(pin->desc);
+    pin->state.timestamp = jiffies;
+    PDEBUG("gpio_rw: GPIO %u changed to %d\n", pin->num, pin->state.value);
+    spin_unlock_irqrestore(&gpio_rw_lock, flags);
+
+    return IRQ_HANDLED;
+}
 
 static int gpio_rw_init_pins(struct device *dev)
 {
@@ -74,42 +117,73 @@ static int gpio_rw_init_pins(struct device *dev)
     int i, ret;
 
     /* get number of pins */
-    num_pins = of_count_phandle_with_args(np, "gpiorw-gpios", "#gpio-cells");
-    if (num_pins <= 0 || num_pins > MAX_PINS) 
+    gpio_data.num_pins = of_count_phandle_with_args(np, "gpiorw-gpios", "#gpio-cells");
+    if (gpio_data.num_pins <= 0 || gpio_data.num_pins > MAX_PINS) 
     {
         pr_err("gpio_rw: invalid number of gpios in DT\n");
         return -EINVAL;
     }
-
-    for (i = 0; i < num_pins; i++) 
+    /* register gpios */
+    for (i = 0; i < gpio_data.num_pins; i++) 
     {
-        gpio_descs[i] = gpiod_get_index(dev, "gpiorw", i, GPIOD_IN);
-        if (IS_ERR(gpio_descs[i])) 
+        gpio_data.pins[i].desc = gpiod_get_index(dev, "gpiorw", i, GPIOD_IN);
+        if (IS_ERR(gpio_data.pins[i].desc)) 
         {
             pr_err("gpio_rw: failed to get gpio index %d\n", i);
-            ret = PTR_ERR(gpio_descs[i]);
+            ret = PTR_ERR(gpio_data.pins[i].desc);
             goto err_get;
         }
-        gpio_nums[i] = desc_to_gpio(gpio_descs[i]);
-        PDEBUG("gpio_rw: got gpio %u at index %d\n", gpio_nums[i], i);
+        gpio_data.pins[i].num = desc_to_gpio(gpio_data.pins[i].desc);
+        PDEBUG("gpio_rw: got gpio %u at index %d\n", gpio_data.pins[i].num, i);
     }
+    /* map interrupts */
+    unsigned long flags;
+    spin_lock_irqsave(&gpio_rw_lock, flags);
+    for( i = 0; i < gpio_data.num_pins; i++ ) 
+    {
+        int irq = gpiod_to_irq(gpio_data.pins[i].desc);
+        if( irq < 0 )
+        {
+            pr_err("gpio_rw: failed to map gpio %u to irq\n", gpio_data.pins[i].num);
+            ret = irq;
+            goto err_irq;
+        }
+        PDEBUG("gpio_rw: gpio %u mapped to irq %d\n", gpio_data.pins[i].num, irq);
+        if( request_irq(irq, gpio_rw_irq_handler, 
+                        IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING,
+                        DEVICE_NAME, (void*)&gpio_data.pins[i]) < 0 )
+        {
+            pr_err("gpio_rw: failed to request irq %d for gpio %u\n", irq, gpio_data.pins[i].num);
+            ret = -EBUSY;
+            goto err_irq;
+        }
+    }
+    spin_unlock_irqrestore(&gpio_rw_lock, flags);
     return 0;
 
+err_irq:
+    while(--i >= 0)
+    {
+        free_irq(gpiod_to_irq(gpio_data.pins[i].desc), (void*)&gpio_data.pins[i]);
+    }
+    i = gpio_data.num_pins;
 err_get:
     while (--i >= 0)
     {
-        gpiod_put(gpio_descs[i]);
+        gpiod_put(gpio_data.pins[i].desc);
     }
-    num_pins = 0;
+    gpio_data.num_pins = 0;
+    spin_unlock_irqrestore(&gpio_rw_lock, flags);
     return ret;
 }
 
 static void gpio_rw_free_pins(void)
 {
     int i;
-    for (i = 0; i < num_pins; i++)
+    for (i = 0; i < gpio_data.num_pins; i++)
     {
-        gpiod_put(gpio_descs[i]);
+        free_irq(gpiod_to_irq(gpio_data.pins[i].desc), (void*)&gpio_data.pins[i]);
+        gpiod_put(gpio_data.pins[i].desc);
     }
 }
 
@@ -156,19 +230,16 @@ static ssize_t gpio_rw_read(struct file *file, char __user *buf,
     if( *offset != 0 )
         return 0; // EOF
 
-    for (i = 0; i < num_pins; i++) 
+    unsigned long flags;
+    spin_lock_irqsave(&gpio_rw_lock, flags);
+    for (i = 0; i < gpio_data.num_pins; i++) 
     {
-        int v = gpiod_get_value(gpio_descs[i]);
-        if (v < 0)
-        {
-            pr_err("gpio_rw: failed to read gpio %u\n", gpio_nums[i]);
-            return v;
-        }
-        if (v)
+        if (gpio_data.pins[i].state.value)
         {
             value |= (1 << i);
         }
     }
+    spin_unlock_irqrestore(&gpio_rw_lock, flags);
     *offset += 1;
 
     PDEBUG("gpio_rw: read value 0x%02x\n", value);
