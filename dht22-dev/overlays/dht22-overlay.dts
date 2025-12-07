@@ -1,0 +1,21 @@
+/dts-v1/;
+/plugin/;
+
+/ {
+    compatible = "brcm,bcm2835";
+
+    fragment@0 {
+        target-path = "/";
+        __overlay__ {
+            dht22-dev {
+                compatible = "dht22";
+                status = "okay";
+                
+                /* Define 2 GPIO pins for Raspberry Pi 3 B+ */
+                /* one for sensor supply, one as input from sensor */
+                dht22-supply-gpios = <&gpio 18 0>;
+                dht22-data-gpios = <&gpio 4 0>;
+            };
+        };
+    };
+};
